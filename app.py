@@ -65,11 +65,15 @@ else:
             r = requests.get(f"{API_URL}/api/live/{system_id}", headers=headers())
             if r.status_code == 200:
                 data = r.json()
+                live = data.get("live", {})
+                fin = data.get("financials", {})
                 col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Productie Vandaag", f"{data.get('production_today_kwh', 0):.1f} kWh")
-                col2.metric("Eigen Verbruik", f"{data.get('self_consumption_kwh', 0):.1f} kWh")
-                col3.metric("Teruglevering", f"{data.get('grid_feed_in_kwh', 0):.1f} kWh")
-                col4.metric("Besparing", f"€{data.get('savings_today_eur', 0):.2f}")
+                col1.metric("Productie", f"{live.get('production_total', 0)} W")
+                col2.metric("Eigen Verbruik", f"{live.get('self_consumption_w', 0)} W")
+                col3.metric("Netlevering", f"{live.get('grid', 0)} W")
+                col4.metric("Besparing Vandaag", f"€{fin.get('savings_today_euro', 0):.2f}")
+                st.subheader("Tarieven")
+                st.write(f"Huidig tarief: **€{fin.get('current_rate_euro', 0):.4f}/kWh**")
                 st.json(data)
             else:
                 st.warning("Geen data beschikbaar")
@@ -115,9 +119,37 @@ else:
 
     elif page == "Gebruikers" and st.session_state.role == "admin":
         st.title("👥 Gebruikers Beheer")
+
+        # Bestaande gebruikers
         try:
             r = requests.get(f"{API_URL}/admin/users", headers=headers())
             if r.status_code == 200:
+                st.subheader("Huidige Gebruikers")
                 st.dataframe(pd.DataFrame(r.json()), use_container_width=True)
         except Exception as e:
             st.error(f"Fout: {e}")
+
+        # Nieuw account aanmaken
+        st.subheader("Nieuw Account Aanmaken")
+        with st.form("create_user"):
+            new_email = st.text_input("E-mail")
+            new_password = st.text_input("Wachtwoord", type="password")
+            new_role = st.selectbox("Rol", ["client", "admin"])
+            submitted = st.form_submit_button("Account Aanmaken", type="primary")
+            if submitted:
+                if new_email and new_password:
+                    try:
+                        r = requests.post(
+                            f"{API_URL}/admin/users",
+                            headers=headers(),
+                            json={"email": new_email, "password": new_password, "role": new_role}
+                        )
+                        if r.status_code == 200:
+                            st.success(f"Account {new_email} aangemaakt!")
+                            st.rerun()
+                        else:
+                            st.error(f"Fout: {r.text}")
+                    except Exception as e:
+                        st.error(f"Fout: {e}")
+                else:
+                    st.warning("Vul alle velden in")
