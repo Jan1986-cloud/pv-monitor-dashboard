@@ -10,7 +10,7 @@ DB_URL = os.getenv("DATABASE_URL", "")
 if DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
-SYSTEM_ID = os.getenv("SYSTEM_ID", "system-001")
+SYSTEM_ID = os.getenv("SYSTEM_ID", "scheepswerf")
 REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "10"))
 
 st.set_page_config(
@@ -20,8 +20,7 @@ st.set_page_config(
 )
 
 # -- Dark industrial CSS --
-st.markdown("""
-<style>
+st.markdown("""<style>
     .stApp { background-color: #0e1117; }
     .kpi-card {
         background: linear-gradient(135deg, #1a1d23 0%, #22262e 100%);
@@ -47,10 +46,11 @@ st.markdown("""
         font-size: 13px;
         margin-top: 4px;
     }
-    .green  { color: #00e676; }
-    .red    { color: #ff5252; }
+    .green { color: #00e676; }
+    .red { color: #ff5252; }
     .orange { color: #ffab40; }
-    .dim    { color: #5c6370; }
+    .cyan { color: #00bcd4; }
+    .dim { color: #5c6370; }
     .inv-card {
         background: #1a1d23;
         border: 1px solid #2a2e36;
@@ -80,20 +80,19 @@ st.markdown("""
         padding: 4px 0 12px 0;
     }
     #MainMenu, footer, header { visibility: hidden; }
-</style>
-""", unsafe_allow_html=True)
-
+</style>""", unsafe_allow_html=True)
 
 # -- Database helper --
 @st.cache_resource
 def get_engine():
     return create_engine(DB_URL, pool_pre_ping=True, pool_size=5)
 
-
 def load_latest(engine):
     q = text("""
-        SELECT timestamp, p1_grid_w, inv_40k_w, inv_50k_w,
-               (inv_40k_w + inv_50k_w) AS inv_total_w, pv_v_avg
+        SELECT timestamp, p1_grid_w, total_limit_w,
+               inv_40k_limit_w, inv_40k_actual_w, inv_40k_pv_v,
+               inv_50k_limit_w, inv_50k_actual_w, inv_50k_pv_v,
+               (inv_40k_actual_w + inv_50k_actual_w) AS inv_total_w
         FROM telemetry_data
         WHERE system_id = :sid
         ORDER BY timestamp DESC
@@ -103,12 +102,12 @@ def load_latest(engine):
         row = conn.execute(q, {"sid": SYSTEM_ID}).mappings().first()
     return dict(row) if row else None
 
-
 def load_history(engine, hours=24):
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     q = text("""
-        SELECT timestamp, p1_grid_w, inv_40k_w, inv_50k_w,
-               (inv_40k_w + inv_50k_w) AS inv_total_w, pv_v_avg
+        SELECT timestamp, p1_grid_w,
+               inv_40k_actual_w, inv_50k_actual_w,
+               (inv_40k_actual_w + inv_50k_actual_w) AS inv_total_w
         FROM telemetry_data
         WHERE system_id = :sid AND timestamp >= :cutoff
         ORDER BY timestamp ASC
@@ -116,7 +115,6 @@ def load_history(engine, hours=24):
     with engine.connect() as conn:
         df = pd.read_sql(q, conn, params={"sid": SYSTEM_ID, "cutoff": cutoff})
     return df
-
 
 # -- Main dashboard --
 st.title("\u26a1 Dashboard Zonnestroom & Netaansluiting \u2014 Scheepswerf")
@@ -129,19 +127,18 @@ if latest is None:
     st.stop()
 
 ts = latest["timestamp"]
-ts_str = ts.strftime("%d-%m-%Y  %H:%M:%S UTC") if hasattr(ts, "strftime") else str(ts)
+ts_str = ts.strftime("%d-%m-%Y %H:%M:%S UTC") if hasattr(ts, "strftime") else str(ts)
 st.markdown(f'<div class="timestamp-bar">Laatste meting: {ts_str}</div>', unsafe_allow_html=True)
 
 # -- KPI Cards --
 grid_w = latest["p1_grid_w"] or 0
-solar_w = (latest["inv_40k_w"] or 0) + (latest["inv_50k_w"] or 0)
-pv_v = latest["pv_v_avg"] or 0.0
+solar_w = (latest["inv_40k_actual_w"] or 0) + (latest["inv_50k_actual_w"] or 0)
+total_limit = latest["total_limit_w"] or 0
 
 grid_color = "green" if grid_w < 0 else "red"
 grid_label = "(Teruglevering)" if grid_w < 0 else "(Afname)"
 
 col1, col2, col3 = st.columns(3)
-
 with col1:
     st.markdown(f"""
     <div class="kpi-card">
@@ -163,9 +160,9 @@ with col2:
 with col3:
     st.markdown(f"""
     <div class="kpi-card">
-        <div class="label">Gem. PV Spanning</div>
-        <div class="value orange">{pv_v:.1f} V</div>
-        <div class="sub dim">Gemiddelde DC-spanning</div>
+        <div class="label">Totaal Limiet</div>
+        <div class="value cyan">{total_limit:,} W</div>
+        <div class="sub dim">Netbeheerder begrenzing</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -208,11 +205,14 @@ else:
 # -- Inverter details --
 st.markdown("---")
 st.subheader("Omvormer Details")
-
 inv_col1, inv_col2 = st.columns(2)
 
-inv40_w = latest["inv_40k_w"] or 0
-inv50_w = latest["inv_50k_w"] or 0
+inv40_w = latest["inv_40k_actual_w"] or 0
+inv50_w = latest["inv_50k_actual_w"] or 0
+inv40_limit = latest["inv_40k_limit_w"] or 0
+inv50_limit = latest["inv_50k_limit_w"] or 0
+inv40_pv_v = latest["inv_40k_pv_v"] or 0.0
+inv50_pv_v = latest["inv_50k_pv_v"] or 0.0
 
 with inv_col1:
     pct40 = (inv40_w / solar_w * 100) if solar_w else 0
@@ -220,7 +220,8 @@ with inv_col1:
     <div class="inv-card">
         <h3>Solis 40K</h3>
         <div class="inv-row"><span class="lbl">Actueel Vermogen</span><span class="val green">{inv40_w:,} W</span></div>
-        <div class="inv-row"><span class="lbl">Gem. PV Spanning</span><span class="val">{pv_v:.1f} V</span></div>
+        <div class="inv-row"><span class="lbl">Limiet</span><span class="val cyan">{inv40_limit:,} W</span></div>
+        <div class="inv-row"><span class="lbl">PV Spanning</span><span class="val">{inv40_pv_v:.1f} V</span></div>
         <div class="inv-row"><span class="lbl">Aandeel Totaal</span><span class="val">{pct40:.0f}%</span></div>
     </div>
     """, unsafe_allow_html=True)
@@ -231,15 +232,13 @@ with inv_col2:
     <div class="inv-card">
         <h3>Solis 50K</h3>
         <div class="inv-row"><span class="lbl">Actueel Vermogen</span><span class="val green">{inv50_w:,} W</span></div>
-        <div class="inv-row"><span class="lbl">Gem. PV Spanning</span><span class="val">{pv_v:.1f} V</span></div>
+        <div class="inv-row"><span class="lbl">Limiet</span><span class="val cyan">{inv50_limit:,} W</span></div>
+        <div class="inv-row"><span class="lbl">PV Spanning</span><span class="val">{inv50_pv_v:.1f} V</span></div>
         <div class="inv-row"><span class="lbl">Aandeel Totaal</span><span class="val">{pct50:.0f}%</span></div>
     </div>
     """, unsafe_allow_html=True)
 
 # -- Auto-refresh --
-st.markdown(f"""
-<meta http-equiv="refresh" content="{REFRESH_SECONDS}">
-""", unsafe_allow_html=True)
-
+st.markdown(f"""<meta http-equiv="refresh" content="{REFRESH_SECONDS}">""", unsafe_allow_html=True)
 st.markdown(f'<div class="timestamp-bar">Auto-verversing elke {REFRESH_SECONDS} seconden</div>',
             unsafe_allow_html=True)
