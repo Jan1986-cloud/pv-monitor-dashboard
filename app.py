@@ -135,8 +135,15 @@ grid_w = latest["p1_grid_w"] or 0
 solar_w = (latest["inv_40k_actual_w"] or 0) + (latest["inv_50k_actual_w"] or 0)
 total_limit = latest["total_limit_w"] or 0
 
-grid_color = "green" if grid_w < 0 else "red"
-grid_label = "(Teruglevering)" if grid_w < 0 else "(Afname)"
+if grid_w < 0:
+    grid_color = "green"
+    grid_label = "(Teruglevering)"
+elif grid_w == 0:
+    grid_color = "dim"
+    grid_label = "(Neutraal)"
+else:
+    grid_color = "red"
+    grid_label = "(Afname)"
 
 col1, col2, col3 = st.columns(3)
 with col1:
