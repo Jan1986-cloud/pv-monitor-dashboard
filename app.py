@@ -1,155 +1,245 @@
 import streamlit as st
-import requests
-import os
 import pandas as pd
-import plotly.express as px
-from datetime import datetime
+import plotly.graph_objects as go
+import os
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import create_engine, text
 
-API_URL = os.getenv("API_URL", "https://pv-monitor-api-production.up.railway.app")
+# -- Config --
+DB_URL = os.getenv("DATABASE_URL", "")
+if DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
-st.set_page_config(page_title="PV Monitor Dashboard", page_icon="☀️", layout="wide")
+SYSTEM_ID = os.getenv("SYSTEM_ID", "system-001")
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "10"))
 
-# Session state
-if "token" not in st.session_state:
-    st.session_state.token = None
-if "role" not in st.session_state:
-    st.session_state.role = None
+st.set_page_config(
+    page_title="Zonnestroom Dashboard - Scheepswerf",
+    page_icon="\u26a1",
+    layout="wide",
+)
 
-def login(username, password):
-    try:
-        r = requests.post(f"{API_URL}/auth/login", json={"username": username, "password": password})
-        if r.status_code == 200:
-            data = r.json()
-            st.session_state.token = data["access_token"]
-            st.session_state.role = data.get("role", "client")
-            return True
-    except Exception:
-        pass
-    return False
+# -- Dark industrial CSS --
+st.markdown("""
+<style>
+    .stApp { background-color: #0e1117; }
+    .kpi-card {
+        background: linear-gradient(135deg, #1a1d23 0%, #22262e 100%);
+        border: 1px solid #333;
+        border-radius: 12px;
+        padding: 24px;
+        text-align: center;
+        margin-bottom: 16px;
+    }
+    .kpi-card .label {
+        font-size: 14px;
+        color: #8892a0;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        margin-bottom: 8px;
+    }
+    .kpi-card .value {
+        font-size: 42px;
+        font-weight: 700;
+        font-family: 'JetBrains Mono', monospace;
+    }
+    .kpi-card .sub {
+        font-size: 13px;
+        margin-top: 4px;
+    }
+    .green  { color: #00e676; }
+    .red    { color: #ff5252; }
+    .orange { color: #ffab40; }
+    .dim    { color: #5c6370; }
+    .inv-card {
+        background: #1a1d23;
+        border: 1px solid #2a2e36;
+        border-radius: 10px;
+        padding: 20px;
+    }
+    .inv-card h3 {
+        margin: 0 0 14px 0;
+        color: #b0bec5;
+        font-size: 18px;
+        border-bottom: 1px solid #333;
+        padding-bottom: 10px;
+    }
+    .inv-row {
+        display: flex;
+        justify-content: space-between;
+        padding: 6px 0;
+        border-bottom: 1px solid #1e2229;
+    }
+    .inv-row .lbl { color: #6b7280; font-size: 14px; }
+    .inv-row .val { color: #e0e0e0; font-weight: 600; font-size: 14px; }
+    h1 { color: #e0e0e0 !important; }
+    .timestamp-bar {
+        text-align: right;
+        color: #5c6370;
+        font-size: 12px;
+        padding: 4px 0 12px 0;
+    }
+    #MainMenu, footer, header { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
 
-def headers():
-    return {"Authorization": f"Bearer {st.session_state.token}"}
 
-# Login page
-if not st.session_state.token:
-    st.title("☀️ PV Monitor - Login")
-    col1, col2, col3 = st.columns([1,2,1])
-    with col2:
-        username = st.text_input("Gebruikersnaam")
-        password = st.text_input("Wachtwoord", type="password")
-        if st.button("Inloggen", type="primary"):
-            if login(username, password):
-                st.rerun()
-            else:
-                st.error("Login mislukt")
+# -- Database helper --
+@st.cache_resource
+def get_engine():
+    return create_engine(DB_URL, pool_pre_ping=True, pool_size=5)
+
+
+def load_latest(engine):
+    q = text("""
+        SELECT timestamp, p1_grid_w, inv_40k_w, inv_50k_w,
+               (inv_40k_w + inv_50k_w) AS inv_total_w, pv_v_avg
+        FROM telemetry_data
+        WHERE system_id = :sid
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """)
+    with engine.connect() as conn:
+        row = conn.execute(q, {"sid": SYSTEM_ID}).mappings().first()
+    return dict(row) if row else None
+
+
+def load_history(engine, hours=24):
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    q = text("""
+        SELECT timestamp, p1_grid_w, inv_40k_w, inv_50k_w,
+               (inv_40k_w + inv_50k_w) AS inv_total_w, pv_v_avg
+        FROM telemetry_data
+        WHERE system_id = :sid AND timestamp >= :cutoff
+        ORDER BY timestamp ASC
+    """)
+    with engine.connect() as conn:
+        df = pd.read_sql(q, conn, params={"sid": SYSTEM_ID, "cutoff": cutoff})
+    return df
+
+
+# -- Main dashboard --
+st.title("\u26a1 Dashboard Zonnestroom & Netaansluiting \u2014 Scheepswerf")
+
+engine = get_engine()
+latest = load_latest(engine)
+
+if latest is None:
+    st.warning("Geen telemetrie-data beschikbaar. Wacht op data van het ESP32-systeem.")
+    st.stop()
+
+ts = latest["timestamp"]
+ts_str = ts.strftime("%d-%m-%Y  %H:%M:%S UTC") if hasattr(ts, "strftime") else str(ts)
+st.markdown(f'<div class="timestamp-bar">Laatste meting: {ts_str}</div>', unsafe_allow_html=True)
+
+# -- KPI Cards --
+grid_w = latest["p1_grid_w"] or 0
+solar_w = (latest["inv_40k_w"] or 0) + (latest["inv_50k_w"] or 0)
+pv_v = latest["pv_v_avg"] or 0.0
+
+grid_color = "green" if grid_w < 0 else "red"
+grid_label = "(Teruglevering)" if grid_w < 0 else "(Afname)"
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.markdown(f"""
+    <div class="kpi-card">
+        <div class="label">Actueel Netverbruik</div>
+        <div class="value {grid_color}">{grid_w:,} W</div>
+        <div class="sub {grid_color}">{grid_label}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col2:
+    st.markdown(f"""
+    <div class="kpi-card">
+        <div class="label">Actuele Zonnestroom</div>
+        <div class="value green">{solar_w:,} W</div>
+        <div class="sub dim">Solis 40K + Solis 50K</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col3:
+    st.markdown(f"""
+    <div class="kpi-card">
+        <div class="label">Gem. PV Spanning</div>
+        <div class="value orange">{pv_v:.1f} V</div>
+        <div class="sub dim">Gemiddelde DC-spanning</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# -- History chart --
+st.markdown("---")
+hours = st.selectbox("Periode", [6, 12, 24, 48, 72], index=2,
+                     format_func=lambda h: f"Laatste {h} uur")
+
+df = load_history(engine, hours=hours)
+
+if df.empty:
+    st.info("Geen historische data voor de geselecteerde periode.")
 else:
-    # Sidebar
-    st.sidebar.title("☀️ PV Monitor")
-    st.sidebar.write(f"Rol: **{st.session_state.role}**")
-    if st.sidebar.button("Uitloggen"):
-        st.session_state.token = None
-        st.session_state.role = None
-        st.rerun()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["timestamp"], y=df["p1_grid_w"],
+        name="Net (W)",
+        line=dict(color="#ff5252", width=2),
+        fill="tozeroy", fillcolor="rgba(255,82,82,0.08)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=df["timestamp"], y=df["inv_total_w"],
+        name="Zonnestroom Totaal (W)",
+        line=dict(color="#00e676", width=2),
+        fill="tozeroy", fillcolor="rgba(0,230,118,0.08)",
+    ))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#13161c",
+        title=dict(text="Historisch Overzicht", font=dict(size=18, color="#b0bec5")),
+        xaxis=dict(title="Tijd", gridcolor="#1e2229"),
+        yaxis=dict(title="Vermogen (W)", gridcolor="#1e2229"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=420,
+        margin=dict(l=60, r=20, t=60, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Admin view
-    if st.session_state.role == "admin":
-        page = st.sidebar.selectbox("Pagina", ["Dashboard", "Systemen", "Gebruikers", "Batterij Simulatie"])
-    else:
-        page = st.sidebar.selectbox("Pagina", ["Dashboard", "Batterij Simulatie"])
+# -- Inverter details --
+st.markdown("---")
+st.subheader("Omvormer Details")
 
-    system_id = st.sidebar.text_input("Systeem ID", value="system-001")
+inv_col1, inv_col2 = st.columns(2)
 
-    if page == "Dashboard":
-        st.title("📊 Live Dashboard")
-        try:
-            r = requests.get(f"{API_URL}/api/live/{system_id}", headers=headers())
-            if r.status_code == 200:
-                data = r.json()
-                live = data.get("live", {})
-                fin = data.get("financials", {})
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Productie", f"{live.get('production_total', 0)} W")
-                col2.metric("Eigen Verbruik", f"{live.get('self_consumption_w', 0)} W")
-                col3.metric("Netlevering", f"{live.get('grid', 0)} W")
-                col4.metric("Besparing Vandaag", f"€{fin.get('savings_today_euro', 0):.2f}")
-                st.subheader("Tarieven")
-                st.write(f"Huidig tarief: **€{fin.get('current_rate_euro', 0):.4f}/kWh**")
-                st.json(data)
-            else:
-                st.warning("Geen data beschikbaar")
-        except Exception as e:
-            st.error(f"API fout: {e}")
+inv40_w = latest["inv_40k_w"] or 0
+inv50_w = latest["inv_50k_w"] or 0
 
-    elif page == "Batterij Simulatie":
-        st.title("🔋 Batterij Simulatie")
-        col1, col2 = st.columns(2)
-        with col1:
-            capacity = st.number_input("Capaciteit (kWh)", value=10.0, step=1.0)
-            max_charge = st.number_input("Max laadvermogen (kW)", value=5.0, step=0.5)
-        with col2:
-            efficiency = st.slider("Rendement (%)", 80, 100, 95) / 100
-            days = st.number_input("Dagen", value=30, step=1)
-        if st.button("Simuleer", type="primary"):
-            try:
-                r = requests.post(f"{API_URL}/api/simulate", headers=headers(), json={
-                    "system_id": system_id, "battery_capacity_kwh": capacity,
-                    "max_charge_rate_kw": max_charge, "efficiency": efficiency, "days": days
-                })
-                if r.status_code == 200:
-                    result = r.json()
-                    st.success("Simulatie voltooid!")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Extra besparing", f"€{result.get('total_savings_eur', 0):.2f}")
-                    c2.metric("Zelfconsumptie +", f"{result.get('self_consumption_increase_pct', 0):.1f}%")
-                    c3.metric("ROI (jaren)", f"{result.get('roi_years', 0):.1f}")
-                    st.json(result)
-                else:
-                    st.error("Simulatie mislukt")
-            except Exception as e:
-                st.error(f"Fout: {e}")
+with inv_col1:
+    pct40 = (inv40_w / solar_w * 100) if solar_w else 0
+    st.markdown(f"""
+    <div class="inv-card">
+        <h3>Solis 40K</h3>
+        <div class="inv-row"><span class="lbl">Actueel Vermogen</span><span class="val green">{inv40_w:,} W</span></div>
+        <div class="inv-row"><span class="lbl">Gem. PV Spanning</span><span class="val">{pv_v:.1f} V</span></div>
+        <div class="inv-row"><span class="lbl">Aandeel Totaal</span><span class="val">{pct40:.0f}%</span></div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    elif page == "Systemen" and st.session_state.role == "admin":
-        st.title("⚙️ Systemen Beheer")
-        try:
-            r = requests.get(f"{API_URL}/admin/systems", headers=headers())
-            if r.status_code == 200:
-                st.dataframe(pd.DataFrame(r.json()), use_container_width=True)
-        except Exception as e:
-            st.error(f"Fout: {e}")
+with inv_col2:
+    pct50 = (inv50_w / solar_w * 100) if solar_w else 0
+    st.markdown(f"""
+    <div class="inv-card">
+        <h3>Solis 50K</h3>
+        <div class="inv-row"><span class="lbl">Actueel Vermogen</span><span class="val green">{inv50_w:,} W</span></div>
+        <div class="inv-row"><span class="lbl">Gem. PV Spanning</span><span class="val">{pv_v:.1f} V</span></div>
+        <div class="inv-row"><span class="lbl">Aandeel Totaal</span><span class="val">{pct50:.0f}%</span></div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    elif page == "Gebruikers" and st.session_state.role == "admin":
-        st.title("👥 Gebruikers Beheer")
+# -- Auto-refresh --
+st.markdown(f"""
+<meta http-equiv="refresh" content="{REFRESH_SECONDS}">
+""", unsafe_allow_html=True)
 
-        # Bestaande gebruikers
-        try:
-            r = requests.get(f"{API_URL}/admin/users", headers=headers())
-            if r.status_code == 200:
-                st.subheader("Huidige Gebruikers")
-                st.dataframe(pd.DataFrame(r.json()), use_container_width=True)
-        except Exception as e:
-            st.error(f"Fout: {e}")
-
-        # Nieuw account aanmaken
-        st.subheader("Nieuw Account Aanmaken")
-        with st.form("create_user"):
-            new_email = st.text_input("E-mail")
-            new_password = st.text_input("Wachtwoord", type="password")
-            new_role = st.selectbox("Rol", ["client", "admin"])
-            submitted = st.form_submit_button("Account Aanmaken", type="primary")
-            if submitted:
-                if new_email and new_password:
-                    try:
-                        r = requests.post(
-                            f"{API_URL}/admin/users",
-                            headers=headers(),
-                            json={"email": new_email, "password": new_password, "role": new_role}
-                        )
-                        if r.status_code == 200:
-                            st.success(f"Account {new_email} aangemaakt!")
-                            st.rerun()
-                        else:
-                            st.error(f"Fout: {r.text}")
-                    except Exception as e:
-                        st.error(f"Fout: {e}")
-                else:
-                    st.warning("Vul alle velden in")
+st.markdown(f'<div class="timestamp-bar">Auto-verversing elke {REFRESH_SECONDS} seconden</div>',
+            unsafe_allow_html=True)
