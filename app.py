@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import os
 import requests
@@ -18,6 +19,36 @@ REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "30"))
 LAT, LON = 52.03, 5.55
 # System peak capacity in kW (40K + 50K = 90 kWp)
 SYSTEM_KWP = 90.0
+
+# -- Sanity limits voor outlier filtering --
+MAX_INV_W        = 60_000
+MAX_TOTAL_W      = 100_000
+MAX_GRID_W       = 200_000
+MAX_SAMPLE_GAP_S = 15 * 60
+
+
+def sanitize_power_df(df):
+    """Zet onmogelijke vermogenswaarden op NaN (niet 0!) zodat de
+    trapezoidale integratie ze overslaat i.p.v. energie te onderschatten."""
+    if df.empty:
+        return df
+    df = df.copy()
+    bounds = {
+        "inv_40k_actual_w": (0, MAX_INV_W),
+        "inv_50k_actual_w": (0, MAX_INV_W),
+        "inv_total_w":      (0, MAX_TOTAL_W),
+        "p1_grid_w":        (-MAX_GRID_W, MAX_GRID_W),
+        "total_limit_w":    (0, MAX_TOTAL_W),
+    }
+    for col, (lo, hi) in bounds.items():
+        if col in df.columns:
+            s = pd.to_numeric(df[col], errors="coerce")
+            df[col] = s.where((s >= lo) & (s <= hi), np.nan)
+    if {"inv_40k_actual_w", "inv_50k_actual_w"}.issubset(df.columns):
+        total = df["inv_40k_actual_w"].fillna(0) + df["inv_50k_actual_w"].fillna(0)
+        df["inv_total_w"] = total.where(total <= MAX_TOTAL_W, np.nan)
+    return df
+
 
 st.set_page_config(
     page_title="Zonnestroom Dashboard - Scheepswerf",
@@ -48,10 +79,7 @@ st.markdown("""<style>
         font-weight: 700;
         font-family: 'JetBrains Mono', monospace;
     }
-    .kpi-card .sub {
-        font-size: 12px;
-        margin-top: 4px;
-    }
+    .kpi-card .sub { font-size: 12px; margin-top: 4px; }
     .green { color: #00e676; }
     .red { color: #ff5252; }
     .orange { color: #ffab40; }
@@ -96,10 +124,12 @@ st.markdown("""<style>
     #MainMenu, footer, header { visibility: hidden; }
 </style>""", unsafe_allow_html=True)
 
+
 # -- Database helper --
 @st.cache_resource
 def get_engine():
     return create_engine(DB_URL, pool_pre_ping=True, pool_size=5)
+
 
 def load_latest(engine):
     q = text("""
@@ -114,7 +144,28 @@ def load_latest(engine):
     """)
     with engine.connect() as conn:
         row = conn.execute(q, {"sid": SYSTEM_ID}).mappings().first()
-    return dict(row) if row else None
+    if not row:
+        return None
+    row = dict(row)
+
+    def _clip(v, lo, hi):
+        if v is None:
+            return None
+        try:
+            v = float(v)
+        except Exception:
+            return None
+        return v if lo <= v <= hi else None
+
+    row["inv_40k_actual_w"] = _clip(row.get("inv_40k_actual_w"), 0, MAX_INV_W)
+    row["inv_50k_actual_w"] = _clip(row.get("inv_50k_actual_w"), 0, MAX_INV_W)
+    row["p1_grid_w"]        = _clip(row.get("p1_grid_w"), -MAX_GRID_W, MAX_GRID_W)
+    row["total_limit_w"]    = _clip(row.get("total_limit_w"), 0, MAX_TOTAL_W)
+    a40 = row["inv_40k_actual_w"] or 0
+    a50 = row["inv_50k_actual_w"] or 0
+    row["inv_total_w"] = a40 + a50
+    return row
+
 
 def load_period_data(engine, start_dt, end_dt):
     """Load telemetry for a date range, returns DataFrame."""
@@ -131,47 +182,59 @@ def load_period_data(engine, start_dt, end_dt):
         df = pd.read_sql(q, conn, params={"sid": SYSTEM_ID, "start": start_dt, "end": end_dt})
     return df
 
+
 def calc_energy_kwh(df):
-    """Calculate energy totals from power samples using trapezoidal integration."""
+    """Energie-totalen via trapezoidale integratie met outlier-filter
+    en gap-clamping (zodat downtime geen valse rechthoek oplevert)."""
+    empty = {"opgewekt_kwh": 0, "afgenomen_kwh": 0, "teruggeleverd_kwh": 0, "netto_kwh": 0}
     if df.empty or len(df) < 2:
-        return {"opgewekt_kwh": 0, "afgenomen_kwh": 0, "teruggeleverd_kwh": 0, "netto_kwh": 0}
-    df = df.copy()
+        return empty
+    df = sanitize_power_df(df)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp")
-    dt_hours = df["timestamp"].diff().dt.total_seconds().div(3600).fillna(0)
-    solar = df["inv_total_w"].fillna(0)
-    grid = df["p1_grid_w"].fillna(0)
-    opgewekt = (solar * dt_hours).sum() / 1000
-    afname = grid.clip(lower=0)
-    terug = grid.clip(upper=0).abs()
-    afgenomen = (afname * dt_hours).sum() / 1000
-    teruggeleverd = (terug * dt_hours).sum() / 1000
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    dt_s = df["timestamp"].diff().dt.total_seconds().fillna(0).clip(upper=MAX_SAMPLE_GAP_S)
+    dt_h = dt_s / 3600.0
+
+    def integrate(series):
+        s = pd.to_numeric(series, errors="coerce").astype(float)
+        avg = (s.shift(1) + s) / 2.0
+        avg = avg.fillna(0)
+        return float((avg * dt_h).sum()) / 1000.0
+
+    grid = pd.to_numeric(df["p1_grid_w"], errors="coerce").fillna(0)
+    opgewekt      = integrate(df["inv_total_w"])
+    afgenomen     = integrate(grid.clip(lower=0))
+    teruggeleverd = integrate(grid.clip(upper=0).abs())
     return {
-        "opgewekt_kwh": round(opgewekt, 1),
-        "afgenomen_kwh": round(afgenomen, 1),
+        "opgewekt_kwh":      round(opgewekt, 1),
+        "afgenomen_kwh":     round(afgenomen, 1),
         "teruggeleverd_kwh": round(teruggeleverd, 1),
-        "netto_kwh": round(afgenomen - teruggeleverd, 1),
+        "netto_kwh":         round(afgenomen - teruggeleverd, 1),
     }
 
+
 def estimate_potential_kwh(df):
-    """Estimate potential production without curtailment.
-    When inverters are at limit, actual production is capped.
-    We estimate uncurtailed production based on the ratio."""
+    """Estimate potential production without curtailment."""
     if df.empty or len(df) < 2:
         return 0
-    df = df.copy()
+    df = sanitize_power_df(df)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp")
-    dt_hours = df["timestamp"].diff().dt.total_seconds().div(3600).fillna(0)
-    actual = df["inv_total_w"].fillna(0)
-    limit = df["total_limit_w"].fillna(90000)
-    # If actual >= 95% of limit, assume curtailment - estimate 15% more potential
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    dt_s = df["timestamp"].diff().dt.total_seconds().fillna(0).clip(upper=MAX_SAMPLE_GAP_S)
+    dt_h = dt_s / 3600.0
+
+    actual = pd.to_numeric(df["inv_total_w"], errors="coerce").astype(float)
+    limit  = pd.to_numeric(df["total_limit_w"], errors="coerce").fillna(90_000).astype(float)
     curtailed = actual >= (limit * 0.95)
     potential = actual.copy()
     potential[curtailed] = actual[curtailed] * 1.15
-    pot_kwh = (potential * dt_hours).sum() / 1000
-    return round(pot_kwh, 1)
 
+    avg = (potential.shift(1) + potential) / 2.0
+    avg = avg.fillna(0)
+    return round(float((avg * dt_h).sum()) / 1000.0, 1)
+    
 @st.cache_data(ttl=3600)
 def get_solar_irradiance(dt_date):
     """Get solar irradiance from Open-Meteo for potential calculation."""
@@ -190,10 +253,12 @@ def get_solar_irradiance(dt_date):
         if "daily" in data:
             sunshine_hrs = (data["daily"].get("sunshine_duration", [0])[0] or 0) / 3600
             radiation = data["daily"].get("shortwave_radiation_sum", [0])[0] or 0
-            return {"sunshine_hours": round(sunshine_hrs, 1), "radiation_kwh_m2": round(radiation / 1000, 2)}
+            return {"sunshine_hours": round(sunshine_hrs, 1),
+                    "radiation_kwh_m2": round(radiation / 1000, 2)}
     except Exception:
         pass
     return {"sunshine_hours": 0, "radiation_kwh_m2": 0}
+
 
 def get_period_dates(period_key):
     """Return (start_dt, end_dt) for a given period key."""
@@ -226,6 +291,7 @@ def get_period_dates(period_key):
         return start, end
     return today, now
 
+
 # ============================================================
 # MAIN DASHBOARD
 # ============================================================
@@ -233,13 +299,13 @@ st.title("\u26a1 Dashboard Zonnestroom & Netaansluiting \u2014 Scheepswerf")
 
 engine = get_engine()
 latest = load_latest(engine)
-
 if latest is None:
     st.warning("Geen telemetrie-data beschikbaar. Wacht op data van het ESP32-systeem.")
     st.stop()
 
 # -- Period selector --
-period_options = ["Vandaag", "Gisteren", "Deze week", "Vorige week", "Deze maand", "Vorige maand", "Dit jaar", "Vorig jaar"]
+period_options = ["Vandaag", "Gisteren", "Deze week", "Vorige week",
+                  "Deze maand", "Vorige maand", "Dit jaar", "Vorig jaar"]
 selected_period = st.selectbox("Periode", period_options, index=0)
 start_dt, end_dt = get_period_dates(selected_period)
 
@@ -289,7 +355,7 @@ with col4:
     <div class="kpi-card">
         <div class="label">Potentieel (zonder limiet)</div>
         <div class="value yellow">{potential:,.1f} kWh</div>
-        <div class="sub orange">Verlies door curtailment: {curtailed:,.1f} kWh</div>
+        <div class="sub dim">Verlies door curtailment: {curtailed:,.1f} kWh</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -299,24 +365,24 @@ with col4:
 st.markdown("---")
 
 if not df_period.empty:
-    df_chart = df_period.copy()
+    df_chart = sanitize_power_df(df_period.copy())
     df_chart["timestamp"] = pd.to_datetime(df_chart["timestamp"])
-
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=df_chart["timestamp"], y=df_chart["inv_total_w"],
+        x=df_chart["timestamp"],
+        y=df_chart["inv_total_w"],
         name="Opwek (W)",
         line=dict(color="#00e676", width=2),
-        fill="tozeroy", fillcolor="rgba(0,230,118,0.08)",
+        fill="tozeroy",
+        fillcolor="rgba(0,230,118,0.08)",
     ))
     fig.add_trace(go.Scatter(
-        x=df_chart["timestamp"], y=df_chart["p1_grid_w"],
+        x=df_chart["timestamp"],
+        y=df_chart["p1_grid_w"],
         name="Net (W)",
         line=dict(color="#ff5252", width=2),
     ))
-    # Zero line
     fig.add_hline(y=0, line_dash="dash", line_color="#333", line_width=1)
-
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="#0e1117",
@@ -350,6 +416,7 @@ with bottom_left:
             <div class="stat-row"><span class="lbl">Systeemcapaciteit</span><span class="val">{SYSTEM_KWP:.0f} kWp</span></div>
         </div>
         """, unsafe_allow_html=True)
+
     with wcol2:
         netto = energy["netto_kwh"]
         netto_color = "red" if netto > 0 else "green"
@@ -382,24 +449,27 @@ with bottom_right:
         grid_label = "Afname"
     inv40_w = latest["inv_40k_actual_w"] or 0
     inv50_w = latest["inv_50k_actual_w"] or 0
-    st.markdown(f"""
+        st.markdown(f"""
     <div class="live-mini">
         <div class="stat-row"><span class="lbl">Laatste meting</span><span class="val dim">{ts_str}</span></div>
-        <div class="stat-row"><span class="lbl">Zonnestroom</span><span class="val green">{solar_w:,} W</span></div>
-        <div class="stat-row"><span class="lbl">Net ({grid_label})</span><span class="val {grid_color}">{grid_w:,} W</span></div>
-        <div class="stat-row"><span class="lbl">Solis 40K</span><span class="val">{inv40_w:,} W</span></div>
-        <div class="stat-row"><span class="lbl">Solis 50K</span><span class="val">{inv50_w:,} W</span></div>
-        <div class="stat-row"><span class="lbl">Limiet</span><span class="val cyan">{latest['total_limit_w'] or 0:,} W</span></div>
+        <div class="stat-row"><span class="lbl">Zonnestroom</span><span class="val green">{solar_w:,.0f} W</span></div>
+        <div class="stat-row"><span class="lbl">Net ({grid_label})</span><span class="val {grid_color}">{grid_w:,.0f} W</span></div>
+        <div class="stat-row"><span class="lbl">Solis 40K</span><span class="val">{inv40_w:,.0f} W</span></div>
+        <div class="stat-row"><span class="lbl">Solis 50K</span><span class="val">{inv50_w:,.0f} W</span></div>
+        <div class="stat-row"><span class="lbl">Limiet</span><span class="val cyan">{(latest['total_limit_w'] or 0):,.0f} W</span></div>
     </div>
     """, unsafe_allow_html=True)
+
 
 # -- Auto-refresh using st.fragment (NO FLICKER) --
 # Streamlit 1.45+ supports run_every on fragments
 import time
 
+
 @st.fragment(run_every=REFRESH_SECONDS)
 def auto_refresh_trigger():
     """This fragment reruns every N seconds without full page reload."""
     st.empty()
+
 
 auto_refresh_trigger()
